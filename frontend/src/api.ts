@@ -24,6 +24,15 @@ export interface PDEType {
   default_params: Record<string, number>
 }
 
+export interface GridData {
+  x: number[]
+  t: number[]
+  u: number[][]
+  u_std?: number[][]
+  u_uncertainty?: number[][]
+  has_uncertainty?: boolean
+}
+
 export interface SolveRequest {
   pde_type: string
   equation_latex: string
@@ -39,20 +48,41 @@ export interface SolveRequest {
   epochs: number
   learning_rate: number
   name: string
+  use_fourier?: boolean
+  use_adaptive_activation?: boolean
+  use_hard_constraint?: boolean
+  use_mc_dropout?: boolean
+  fourier_bands?: number[]
+  fourier_freqs?: number
+  dropout_rate?: number
+  mc_samples?: number
+  log_interval?: number
 }
 
-export interface GridData {
-  x: number[]
-  t: number[]
-  u: number[][]
+export interface SolveStartResponse {
+  task_id: string
+  status: string
+  message: string
 }
 
-export interface SolveResponse {
+export interface SolveCompleteResponse {
   id: number
   status: string
   final_loss: number
   training_history: TrainingHistoryPoint[]
   grid_data: GridData
+  final_epochs: number
+}
+
+export interface AdvancedOptions {
+  use_fourier: boolean
+  use_adaptive_activation: boolean
+  use_hard_constraint: boolean
+  use_mc_dropout: boolean
+  fourier_bands: number[]
+  fourier_freqs: number
+  dropout_rate: number
+  mc_samples: number
 }
 
 export interface HistoryRecord {
@@ -81,10 +111,21 @@ export interface HistoryRecord {
 
 export const fetchPDETypes = () => api.get<{ types: PDEType[] }>('/pde-types')
 
-export const solvePDE = (data: SolveRequest) => api.post<SolveResponse>('/solve', data)
+export const fetchAdvancedOptions = () => api.get<AdvancedOptions>('/advanced-options')
 
-export const predictPDE = (id: number, nx = 100, nt = 100) =>
-  api.post<GridData>(`/predict/${id}`, { nx, nt })
+export const solvePDE = (data: SolveRequest) =>
+  api.post<SolveStartResponse>('/solve', data)
+
+export const predictPDE = (
+  id: number,
+  nx = 100,
+  nt = 100,
+  mc_samples = 30,
+  compute_uncertainty = true
+) =>
+  api.post<GridData>(`/predict/${id}`, {
+    nx, nt, mc_samples, compute_uncertainty
+  })
 
 export const fetchHistory = () => api.get<HistoryRecord[]>('/history')
 
@@ -94,5 +135,59 @@ export const deleteRecord = (id: number) => api.delete(`/history/${id}`)
 
 export const getExportUrl = (id: number, format: 'csv' | 'vtk' | 'vtk3d') =>
   `${API_BASE}/export/${id}/${format}`
+
+export interface SSEProgressEvent {
+  epoch: number
+  loss: number
+  loss_ic?: number
+  loss_bc?: number
+  loss_pde?: number
+}
+
+export type SSEHandler = {
+  onProgress?: (e: SSEProgressEvent) => void
+  onComplete?: (r: SolveCompleteResponse) => void
+  onError?: (err: string) => void
+  onConnected?: (clientId: string) => void
+}
+
+export function createSSEConnection(handler: SSEHandler): EventSource {
+  const es = new EventSource(`${API_BASE}/stream`, { withCredentials: false })
+
+  es.addEventListener('connected', (ev: any) => {
+    try {
+      const data = JSON.parse(ev.data)
+      if (handler.onConnected) handler.onConnected(data.client_id)
+    } catch {}
+  })
+
+  es.addEventListener('progress', (ev: any) => {
+    try {
+      const data = JSON.parse(ev.data) as SSEProgressEvent
+      if (handler.onProgress) handler.onProgress(data)
+    } catch {}
+  })
+
+  es.addEventListener('complete', (ev: any) => {
+    try {
+      const data = JSON.parse(ev.data) as SolveCompleteResponse
+      if (handler.onComplete) handler.onComplete(data)
+      es.close()
+    } catch {}
+  })
+
+  es.addEventListener('error', (ev: any) => {
+    try {
+      const parsed = JSON.parse(ev.data)
+      if (handler.onError) handler.onError(parsed.error || 'Unknown error')
+    } catch {
+      if (ev.readyState === EventSource.CLOSED) {
+        es.close()
+      }
+    }
+  })
+
+  return es
+}
 
 export default api

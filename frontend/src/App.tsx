@@ -1,20 +1,24 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import FormulaEditor from './components/FormulaEditor'
-import Visualization3D from './components/Visualization3D'
+import Visualization3D, { VizMode } from './components/Visualization3D'
 import HistoryPanel from './components/HistoryPanel'
 import ExportPanel from './components/ExportPanel'
 import LossChart from './components/LossChart'
 import {
   fetchPDETypes,
+  fetchAdvancedOptions,
   solvePDE,
   fetchHistory,
   predictPDE,
+  createSSEConnection,
   PDEType,
   SolveRequest,
   GridData,
   HistoryRecord,
-  SolveResponse,
   TrainingHistoryPoint,
+  AdvancedOptions,
+  SSEProgressEvent,
+  SolveCompleteResponse,
 } from './api'
 
 const PDE_PRESETS: Record<string, { equation: string; ic: string; bcLeft: string; bcRight: string }> = {
@@ -38,10 +42,21 @@ const PDE_PRESETS: Record<string, { equation: string; ic: string; bcLeft: string
   },
   general: {
     equation: '\\frac{\\partial u}{\\partial t} = \\alpha \\frac{\\partial^2 u}{\\partial x^2}',
-    ic: 'sin(pi*x)',
+    ic: 'sin(pi*x) + 0.1*sin(10*pi*x)',
     bcLeft: '0',
     bcRight: '0',
   },
+}
+
+const DEFAULT_ADVANCED: AdvancedOptions = {
+  use_fourier: true,
+  use_adaptive_activation: true,
+  use_hard_constraint: true,
+  use_mc_dropout: true,
+  fourier_bands: [0.01, 0.1, 1, 10],
+  fourier_freqs: 32,
+  dropout_rate: 0.1,
+  mc_samples: 30,
 }
 
 function App() {
@@ -60,8 +75,18 @@ function App() {
   const [epochs, setEpochs] = useState(5000)
   const [learningRate, setLearningRate] = useState(0.001)
   const [solveName, setSolveName] = useState('')
+
+  const [advanced, setAdvanced] = useState<AdvancedOptions>(DEFAULT_ADVANCED)
+  const [showAdvanced, setShowAdvanced] = useState(true)
+  const [vizMode, setVizMode] = useState<VizMode>('mean')
+  const [showUncBand, setShowUncBand] = useState(true)
+  const [logInterval, setLogInterval] = useState(20)
+  const [progressEta, setProgressEta] = useState<{ epoch: number; progressPct: number; elapsed: number } | null>(null)
+
   const [isSolving, setIsSolving] = useState(false)
   const [solveStatus, setSolveStatus] = useState<string>('')
+  const [solveErrorMsg, setSolveErrorMsg] = useState<string>('')
+
   const [gridData, setGridData] = useState<GridData | null>(null)
   const [history, setHistory] = useState<HistoryRecord[]>([])
   const [selectedRecordId, setSelectedRecordId] = useState<number | null>(null)
@@ -71,21 +96,18 @@ function App() {
   const [trainingHistory, setTrainingHistory] = useState<TrainingHistoryPoint[]>([])
   const [currentRecordId, setCurrentRecordId] = useState<number | null>(null)
   const animRef = useRef<number | null>(null)
+  const sseRef = useRef<EventSource | null>(null)
+  const startTimeRef = useRef<number>(0)
+  const clientIdRef = useRef<string>('')
 
   useEffect(() => {
     fetchPDETypes()
       .then((res) => setPdeTypes(res.data.types))
       .catch(console.error)
+    fetchAdvancedOptions()
+      .then((res) => { if (res.data) setAdvanced({ ...DEFAULT_ADVANCED, ...res.data }) })
+      .catch(() => setAdvanced(DEFAULT_ADVANCED))
     loadHistory()
-  }, [])
-
-  const loadHistory = useCallback(async () => {
-    try {
-      const res = await fetchHistory()
-      setHistory(res.data)
-    } catch (err) {
-      console.error('Failed to load history:', err)
-    }
   }, [])
 
   useEffect(() => {
@@ -103,6 +125,15 @@ function App() {
     }
   }, [isAnimating, gridData])
 
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetchHistory()
+      setHistory(res.data)
+    } catch (err) {
+      console.error('Failed to load history:', err)
+    }
+  }, [])
+
   const handleTypeSelect = (type: string) => {
     setSelectedType(type)
     const preset = PDE_PRESETS[type]
@@ -118,9 +149,24 @@ function App() {
     }
   }
 
+  const closeSSE = () => {
+    if (sseRef.current) {
+      try { sseRef.current.close() } catch {}
+      sseRef.current = null
+    }
+  }
+
   const handleSolve = async () => {
     setIsSolving(true)
     setSolveStatus('solving')
+    setSolveErrorMsg('')
+    setProgressEta(null)
+    setTrainingHistory([])
+    setGridData(null)
+    setCurrentRecordId(null)
+    setVizMode('mean')
+    startTimeRef.current = Date.now()
+
     try {
       const request: SolveRequest = {
         pde_type: selectedType,
@@ -137,30 +183,76 @@ function App() {
         epochs,
         learning_rate: learningRate,
         name: solveName || `${selectedType}_${new Date().toLocaleTimeString('zh-CN')}`,
+        use_fourier: advanced.use_fourier,
+        use_adaptive_activation: advanced.use_adaptive_activation,
+        use_hard_constraint: advanced.use_hard_constraint,
+        use_mc_dropout: advanced.use_mc_dropout,
+        fourier_bands: advanced.fourier_bands,
+        fourier_freqs: advanced.fourier_freqs,
+        dropout_rate: advanced.dropout_rate,
+        mc_samples: advanced.mc_samples,
+        log_interval: logInterval,
       }
-      const res = await solvePDE(request)
-      const data = res.data
-      setGridData(data.grid_data)
-      setCurrentTimeIndex(data.grid_data.t.length - 1)
-      setTrainingHistory(data.training_history)
-      setCurrentRecordId(data.id)
-      setSelectedRecordId(data.id)
-      setSolveStatus('completed')
-      await loadHistory()
+
+      closeSSE()
+
+      const startRes = await solvePDE(request)
+      const taskId = startRes.data.task_id
+      console.log('Started task:', taskId)
+
+      const sse = createSSEConnection({
+        onConnected: (cid) => { clientIdRef.current = cid; console.log('SSE connected, client=', cid) },
+        onProgress: (ev: SSEProgressEvent) => {
+          setTrainingHistory((prev) => {
+            const prev2 = prev.length >= 2000 ? prev.slice(-1000) : prev
+            return [...prev2, ev]
+          })
+          const elapsed = (Date.now() - startTimeRef.current) / 1000
+          const pct = Math.min(100, (ev.epoch / Math.max(1, epochs)) * 100)
+          setProgressEta({ epoch: ev.epoch, progressPct: pct, elapsed })
+        },
+        onComplete: (data: SolveCompleteResponse) => {
+          console.log('SSE complete:', data.id, 'final_loss=', data.final_loss)
+          setGridData(data.grid_data)
+          setCurrentTimeIndex(data.grid_data.t.length - 1)
+          setTrainingHistory(data.training_history)
+          setCurrentRecordId(data.id)
+          setSelectedRecordId(data.id)
+          setSolveStatus('completed')
+          setIsSolving(false)
+          closeSSE()
+          loadHistory()
+        },
+        onError: (err: string) => {
+          console.error('SSE error:', err)
+          setSolveStatus('error')
+          setSolveErrorMsg(err)
+          setIsSolving(false)
+          closeSSE()
+        },
+      })
+      sseRef.current = sse
+
     } catch (err: any) {
-      console.error('Solve failed:', err)
+      console.error('Solve start failed:', err)
       setSolveStatus('error')
-      alert(`求解失败: ${err.response?.data?.error || err.message}`)
-    } finally {
+      setSolveErrorMsg(err?.response?.data?.error || err.message || 'Unknown error')
       setIsSolving(false)
+      closeSSE()
     }
+  }
+
+  const handleCancel = () => {
+    setIsSolving(false)
+    setSolveStatus('')
+    closeSSE()
   }
 
   const handleSelectRecord = async (record: HistoryRecord) => {
     setSelectedRecordId(record.id)
     setCurrentRecordId(record.id)
     try {
-      const res = await predictPDE(record.id, 100, 100)
+      const res = await predictPDE(record.id, 100, 100, advanced.mc_samples, advanced.use_mc_dropout)
       setGridData(res.data)
       setCurrentTimeIndex(res.data.t.length - 1)
       setTrainingHistory(record.training_history || [])
@@ -176,6 +268,7 @@ function App() {
         t_max: record.domain_t_max,
       })
       setParams(record.params)
+      setVizMode('mean')
     } catch (err) {
       console.error('Failed to load record:', err)
     }
@@ -183,15 +276,26 @@ function App() {
 
   const handleDeleteRecord = (id: number) => {
     setHistory((prev) => prev.filter((r) => r.id !== id))
-    if (selectedRecordId === id) {
-      setSelectedRecordId(null)
-    }
-    if (currentRecordId === id) {
-      setCurrentRecordId(null)
-    }
+    if (selectedRecordId === id) setSelectedRecordId(null)
+    if (currentRecordId === id) setCurrentRecordId(null)
   }
 
+  useEffect(() => {
+    return () => closeSSE()
+  }, [])
+
   const layersStr = layers.join(', ')
+
+  const hasUncertainty = !!gridData?.has_uncertainty && (gridData?.u_uncertainty || gridData?.u_std)
+
+  const updateFourierBands = (val: string) => {
+    const parsed = val.split(',').map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0)
+    if (parsed.length >= 1) setAdvanced({ ...advanced, fourier_bands: parsed })
+  }
+
+  const uncAll = gridData?.u_uncertainty ? gridData.u_uncertainty.flat() : []
+  const uncMax = uncAll.length > 0 ? Math.max(...uncAll) : 0
+  const uncMean = uncAll.length > 0 ? uncAll.reduce((a: number, b: number) => a + b, 0) / uncAll.length : 0
 
   return (
     <div className="app-container">
@@ -391,29 +495,142 @@ function App() {
             </div>
           </div>
 
-          <button
-            className="btn btn-primary btn-block"
-            onClick={handleSolve}
-            disabled={isSolving}
-            style={{ marginTop: '8px', padding: '12px' }}
-          >
-            {isSolving ? (
-              <>
-                <span className="loading-spinner" />
-                正在求解...
-              </>
-            ) : (
-              <>🚀 开始求解</>
+          <div className="section">
+            <div className="section-title" style={{ cursor: 'pointer', userSelect: 'none' }} onClick={() => setShowAdvanced(!showAdvanced)}>
+              <span style={{ marginRight: 6 }}>{showAdvanced ? '▾' : '▸'}</span>
+              高级训练选项
+            </div>
+            {showAdvanced && (
+              <div style={{ padding: '4px 0', borderTop: '1px solid var(--border-color)', marginTop: 8 }}>
+                <div className="checkbox-row">
+                  <label className="check-label">
+                    <input type="checkbox" checked={advanced.use_hard_constraint} onChange={(e) => setAdvanced({ ...advanced, use_hard_constraint: e.target.checked })} />
+                    <span>硬约束网络 (距离函数边界编码)</span>
+                  </label>
+                </div>
+                <div className="checkbox-row">
+                  <label className="check-label">
+                    <input type="checkbox" checked={advanced.use_adaptive_activation} onChange={(e) => setAdvanced({ ...advanced, use_adaptive_activation: e.target.checked })} />
+                    <span>自适应激活函数 (可学习斜率)</span>
+                  </label>
+                </div>
+                <div className="checkbox-row">
+                  <label className="check-label">
+                    <input type="checkbox" checked={advanced.use_fourier} onChange={(e) => setAdvanced({ ...advanced, use_fourier: e.target.checked })} />
+                    <span>多频段傅里叶特征映射</span>
+                  </label>
+                </div>
+                <div className="checkbox-row">
+                  <label className="check-label">
+                    <input type="checkbox" checked={advanced.use_mc_dropout} onChange={(e) => setAdvanced({ ...advanced, use_mc_dropout: e.target.checked })} />
+                    <span>蒙特卡洛Dropout (不确定性估计)</span>
+                  </label>
+                </div>
+                {advanced.use_fourier && (
+                  <div className="form-group" style={{ marginTop: 6 }}>
+                    <label>傅里叶频段 (逗号分隔)</label>
+                    <input
+                      type="text"
+                      value={advanced.fourier_bands.join(', ')}
+                      onChange={(e) => updateFourierBands(e.target.value)}
+                    />
+                  </div>
+                )}
+                <div className="form-group" style={{ marginTop: 4 }}>
+                  <label>每频段频率数</label>
+                  <input
+                    type="number"
+                    min={4}
+                    max={256}
+                    value={advanced.fourier_freqs}
+                    onChange={(e) => setAdvanced({ ...advanced, fourier_freqs: Math.max(4, Math.min(256, parseInt(e.target.value) || 32)) })}
+                  />
+                </div>
+                {advanced.use_mc_dropout && (
+                  <>
+                    <div className="form-group" style={{ marginTop: 4 }}>
+                      <label>Dropout概率</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={0.9}
+                        step={0.01}
+                        value={advanced.dropout_rate}
+                        onChange={(e) => setAdvanced({ ...advanced, dropout_rate: Math.max(0, Math.min(0.9, parseFloat(e.target.value) || 0.1)) })}
+                      />
+                    </div>
+                    <div className="form-group" style={{ marginTop: 4 }}>
+                      <label>MC采样数</label>
+                      <input
+                        type="number"
+                        min={2}
+                        max={200}
+                        value={advanced.mc_samples}
+                        onChange={(e) => setAdvanced({ ...advanced, mc_samples: Math.max(2, Math.min(200, parseInt(e.target.value) || 30)) })}
+                      />
+                    </div>
+                  </>
+                )}
+                <div className="form-group" style={{ marginTop: 4 }}>
+                  <label>日志间隔 (epoch)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={500}
+                    value={logInterval}
+                    onChange={(e) => setLogInterval(Math.max(1, Math.min(500, parseInt(e.target.value) || 20)))}
+                  />
+                </div>
+              </div>
             )}
-          </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              className="btn btn-primary btn-block"
+              onClick={handleSolve}
+              disabled={isSolving}
+              style={{ marginTop:8, padding: '12px', flex: 1 }}
+            >
+              {isSolving ? (
+                <>
+                  <span className="loading-spinner" />
+                  正在求解...
+                </>
+              ) : (
+                <>🚀 开始求解</>
+              )}
+            </button>
+            {isSolving && (
+              <button
+                className="btn btn-secondary"
+                onClick={handleCancel}
+                style={{ marginTop: 8, padding: '12px 16px' }}
+                title="取消训练"
+              >
+                ✕
+              </button>
+            )}
+          </div>
 
           {solveStatus && (
-            <div style={{ marginTop: '8px' }}>
+            <div style={{ marginTop: 8 }}>
               <span className={`status-badge ${solveStatus}`}>
-                {solveStatus === 'solving' && '求解中'}
+                {solveStatus === 'solving' && progressEta && `求解中 · epoch ${progressEta.epoch}/${epochs} (${progressEta.progressPct.toFixed(1)}%)`}
+                {solveStatus === 'solving' && !progressEta && '求解中 (初始化中...)'}
                 {solveStatus === 'completed' && '已完成'}
                 {solveStatus === 'error' && '出错'}
               </span>
+              {solveErrorMsg && (
+                <div style={{ color: '#ff6b6b', fontSize: 12, marginTop: 6, lineHeight: 1.5, wordBreak: 'break-word' }}>
+                  {solveErrorMsg}
+                </div>
+              )}
+              {progressEta && solveStatus === 'solving' && (
+                <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                  已用时 {progressEta.elapsed.toFixed(1)}s
+                </div>
+              )}
             </div>
           )}
 
@@ -440,16 +657,61 @@ function App() {
         <div className="top-bar">
           <span className="top-bar-title">数值解可视化</span>
           <div className="toolbar">
+            {hasUncertainty && (
+              <>
+                <div style={{ display: 'flex', gap: 2, background: 'var(--bg-tertiary)', borderRadius: 4, padding: 2 }}>
+                  <button
+                    onClick={() => setVizMode('mean')}
+                    style={{
+                      background: vizMode === 'mean' ? 'var(--accent-primary)' : 'transparent',
+                      border: 'none',
+                      color: vizMode === 'mean' ? '#fff' : 'var(--text-secondary)',
+                      padding: '4px 10px',
+                      borderRadius: 3,
+                      fontSize: 11,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    均值 u(x,t)
+                  </button>
+                  <button
+                    onClick={() => setVizMode('uncertainty')}
+                    style={{
+                      background: vizMode === 'uncertainty' ? '#c13b55' : 'transparent',
+                      border: 'none',
+                      color: vizMode === 'uncertainty' ? '#fff' : 'var(--text-secondary)',
+                      padding: '4px 10px',
+                      borderRadius: 3,
+                      fontSize: 11,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    不确定性 2σ
+                  </button>
+                </div>
+                <div className="divider" />
+                <label style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={showUncBand}
+                    onChange={(e) => setShowUncBand(e.target.checked)}
+                    style={{ marginTop: 0 }}
+                  />
+                  置信带
+                </label>
+                <div className="divider" />
+              </>
+            )}
             <select
               value={colorScheme}
               onChange={(e) => setColorScheme(e.target.value)}
               style={{
                 background: 'var(--bg-tertiary)',
                 border: '1px solid var(--border-color)',
-                borderRadius: '4px',
+                borderRadius: 4,
                 color: 'var(--text-primary)',
                 padding: '4px 8px',
-                fontSize: '12px',
+                fontSize: 12,
               }}
             >
               <option value="plasma">Plasma</option>
@@ -457,24 +719,16 @@ function App() {
               <option value="coolwarm">Coolwarm</option>
             </select>
             <div className="divider" />
-            <button
-              className="btn btn-sm btn-secondary"
-              onClick={() => setIsAnimating(!isAnimating)}
-            >
+            <button className="btn btn-sm btn-secondary" onClick={() => setIsAnimating(!isAnimating)}>
               {isAnimating ? '⏸ 暂停' : '▶ 播放'}
             </button>
             <button
               className="btn btn-sm btn-secondary"
-              onClick={() => {
-                if (gridData) setCurrentTimeIndex(gridData.t.length - 1)
-              }}
+              onClick={() => { if (gridData) setCurrentTimeIndex(gridData.t.length - 1) }}
             >
               ⏭ 末帧
             </button>
-            <button
-              className="btn btn-sm btn-secondary"
-              onClick={() => setCurrentTimeIndex(0)}
-            >
+            <button className="btn btn-sm btn-secondary" onClick={() => setCurrentTimeIndex(0)}>
               ⏮ 首帧
             </button>
           </div>
@@ -486,20 +740,54 @@ function App() {
             isAnimating={isAnimating}
             currentTimeIndex={currentTimeIndex}
             colorScheme={colorScheme}
+            vizMode={vizMode}
+            showUncertaintyBand={showUncBand}
           />
 
           {gridData && (
-            <div className="time-slider-container">
-              <label>时间步</label>
-              <input
-                type="range"
-                min={0}
-                max={gridData.t.length - 1}
-                value={currentTimeIndex}
-                onChange={(e) => setCurrentTimeIndex(parseInt(e.target.value))}
-              />
-              <span className="time-value">t = {gridData.t[currentTimeIndex]?.toFixed(3)}</span>
-            </div>
+            <>
+              <div className="time-slider-container">
+                <label>时间步</label>
+                <input
+                  type="range"
+                  min={0}
+                  max={gridData.t.length - 1}
+                  value={currentTimeIndex}
+                  onChange={(e) => setCurrentTimeIndex(parseInt(e.target.value))}
+                />
+                <span className="time-value">t = {gridData.t[currentTimeIndex]?.toFixed(3)}</span>
+              </div>
+              {hasUncertainty && (
+                <div style={{
+                  padding: '8px 16px',
+                  background: 'rgba(193, 59, 85, 0.08)',
+                  border: '1px solid rgba(193, 59, 85, 0.3)',
+                  borderRadius: 6,
+                  margin: '0 16px 8px',
+                  display: 'flex',
+                  gap: 20,
+                  fontSize: 12,
+                  flexWrap: 'wrap',
+                }}>
+                  <div>
+                    <span style={{ color: 'var(--text-secondary)' }}>最大不确定性 (95%CI):</span>
+                    <strong style={{ color: '#ff8a8a', marginLeft: 4 }}>
+                      {uncMax.toExponential(3)}
+                    </strong>
+                  </div>
+                  <div>
+                    <span style={{ color: 'var(--text-secondary)' }}>平均不确定性:</span>
+                    <strong style={{ color: '#ff8a8a', marginLeft: 4 }}>
+                      {uncMean.toExponential(3)}
+                    </strong>
+                  </div>
+                  <div>
+                    <span style={{ color: 'var(--text-secondary)' }}>MC采样数:</span>
+                    <strong style={{ color: '#ff8a8a', marginLeft: 4 }}>{advanced.mc_samples}</strong>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
