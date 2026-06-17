@@ -1,0 +1,27 @@
+.formula-editor {
+  margin-bottom: 4px;
+}
+
+.form-group-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.quick-inserts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.quick-inserts .btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  font-family: serif;
+}
+
+.quick-inserts .katex {
+  font-size: 12px;
+}
