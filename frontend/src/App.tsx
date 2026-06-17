@@ -4,6 +4,9 @@ import Visualization3D, { VizMode } from './components/Visualization3D'
 import HistoryPanel from './components/HistoryPanel'
 import ExportPanel from './components/ExportPanel'
 import LossChart from './components/LossChart'
+import LibraryPanel from './components/LibraryPanel'
+import HyperOptPanel from './components/HyperOptPanel'
+import ComparisonPanel from './components/ComparisonPanel'
 import {
   fetchPDETypes,
   fetchAdvancedOptions,
@@ -19,6 +22,11 @@ import {
   AdvancedOptions,
   SSEProgressEvent,
   SolveCompleteResponse,
+  fetchLibraryCase,
+  solveLibraryCase,
+  LibraryCaseDetail,
+  ComparisonResult,
+  LibrarySolveCompleteResponse,
 } from './api'
 
 const PDE_PRESETS: Record<string, { equation: string; ic: string; bcLeft: string; bcRight: string }> = {
@@ -100,6 +108,14 @@ function App() {
   const startTimeRef = useRef<number>(0)
   const clientIdRef = useRef<string>('')
 
+  const [leftTab, setLeftTab] = useState<'custom' | 'library' | 'history'>('library')
+  const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null)
+  const [selectedCaseDetail, setSelectedCaseDetail] = useState<LibraryCaseDetail | null>(null)
+  const [comparison, setComparison] = useState<ComparisonResult | null>(null)
+  const [mainBottomTab, setMainBottomTab] = useState<'viz' | 'compare'>('viz')
+  const [runFdmOnSolve, setRunFdmOnSolve] = useState(true)
+  const [runHpOnSolve, setRunHpOnSolve] = useState(false)
+
   useEffect(() => {
     fetchPDETypes()
       .then((res) => setPdeTypes(res.data.types))
@@ -154,6 +170,123 @@ function App() {
       try { sseRef.current.close() } catch {}
       sseRef.current = null
     }
+  }
+
+  const handleLibraryCaseSelect = async (caseId: string) => {
+    setSelectedCaseId(caseId)
+    try {
+      const { data } = await fetchLibraryCase(caseId)
+      setSelectedCaseDetail(data)
+      setSelectedType(data.pde_type)
+      setEquationLatex(data.equation_latex)
+      setIcExpression(data.ic_expression)
+      setBcLeftExpression(data.bc_left_expression)
+      setBcRightExpression(data.bc_right_expression)
+      const dm: any = { x_min: 0, x_max: 1, t_min: 0, t_max: 1 }
+      if (data.domain) {
+        if (data.domain.x) { dm.x_min = data.domain.x[0]; dm.x_max = data.domain.x[1] }
+        if (data.domain.t) { dm.t_min = data.domain.t[0]; dm.t_max = data.domain.t[1] }
+      }
+      setDomain(dm)
+      setParams({ ...data.params })
+      if (data.default_layers) setLayers(data.default_layers)
+      if (data.default_epochs) setEpochs(data.default_epochs)
+      setSolveName(`${data.name}_${new Date().toLocaleTimeString('zh-CN')}`)
+    } catch (err) {
+      console.error('Failed to load case:', err)
+    }
+  }
+
+  const handleSolveLibraryCase = async (caseId: string) => {
+    setIsSolving(true)
+    setSolveStatus('solving')
+    setSolveErrorMsg('')
+    setProgressEta(null)
+    setTrainingHistory([])
+    setGridData(null)
+    setCurrentRecordId(null)
+    setComparison(null)
+    setVizMode('mean')
+    setMainBottomTab('viz')
+    startTimeRef.current = Date.now()
+
+    try {
+      await handleLibraryCaseSelect(caseId)
+      closeSSE()
+
+      const startRes = await solveLibraryCase(caseId, {
+        epochs,
+        layers,
+        use_fourier: advanced.use_fourier,
+        use_adaptive_activation: advanced.use_adaptive_activation,
+        use_hard_constraint: advanced.use_hard_constraint,
+        use_mc_dropout: advanced.use_mc_dropout,
+        fourier_bands: advanced.fourier_bands,
+        fourier_freqs: advanced.fourier_freqs,
+        dropout_rate: advanced.dropout_rate,
+        mc_samples: advanced.mc_samples,
+        log_interval: logInterval,
+        n_collocation: nCollocation,
+        learning_rate: learningRate,
+        run_fdm_compare: runFdmOnSolve,
+        run_hyperopt: runHpOnSolve,
+        hp_n_trials: 8,
+        hp_quick_epochs: 150,
+        name: solveName,
+      })
+
+      const taskId = startRes.data.task_id
+      console.log('Library solve started:', taskId)
+
+      const sse = createSSEConnection({
+        onConnected: (cid) => { clientIdRef.current = cid },
+        onProgress: (ev: SSEProgressEvent) => {
+          setTrainingHistory((prev) => {
+            const prev2 = prev.length >= 2000 ? prev.slice(-1000) : prev
+            return [...prev2, ev]
+          })
+          const elapsed = (Date.now() - startTimeRef.current) / 1000
+          const pct = Math.min(100, (ev.epoch / Math.max(1, epochs)) * 100)
+          setProgressEta({ epoch: ev.epoch, progressPct: pct, elapsed })
+        },
+        onComplete: (raw: any) => {
+          const data = raw as LibrarySolveCompleteResponse
+          console.log('Library solve complete:', data.id, 'loss=', data.final_loss, 'comparison=', !!data.comparison)
+          setGridData(data.grid_data)
+          setCurrentTimeIndex(data.grid_data.t.length - 1)
+          setTrainingHistory(data.training_history)
+          setCurrentRecordId(data.id)
+          setSelectedRecordId(data.id)
+          if (data.comparison) {
+            setComparison(data.comparison)
+            setMainBottomTab('compare')
+          }
+          setSolveStatus('completed')
+          setIsSolving(false)
+          closeSSE()
+          loadHistory()
+        },
+        onError: (err: string) => {
+          setSolveStatus('error')
+          setSolveErrorMsg(err)
+          setIsSolving(false)
+          closeSSE()
+        },
+      })
+      sseRef.current = sse
+
+    } catch (err: any) {
+      setSolveStatus('error')
+      setSolveErrorMsg(err?.response?.data?.error || err.message || 'Unknown error')
+      setIsSolving(false)
+      closeSSE()
+    }
+  }
+
+  const applyHyperOptBest = (best: Record<string, any>) => {
+    if (best.layers) setLayers(best.layers)
+    if (best.learning_rate) setLearningRate(best.learning_rate)
+    if (best.n_collocation) setNCollocation(best.n_collocation)
   }
 
   const handleSolve = async () => {
@@ -305,7 +438,40 @@ function App() {
           <p>物理信息神经网络 · 偏微分方程数值求解器</p>
         </div>
 
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
+        <div className="left-tabs">
+          <button
+            className={`left-tab ${leftTab === 'library' ? 'active' : ''}`}
+            onClick={() => setLeftTab('library')}
+          >
+            📚 方程库
+          </button>
+          <button
+            className={`left-tab ${leftTab === 'custom' ? 'active' : ''}`}
+            onClick={() => setLeftTab('custom')}
+          >
+            ⚙️ 自定义
+          </button>
+          <button
+            className={`left-tab ${leftTab === 'history' ? 'active' : ''}`}
+            onClick={() => setLeftTab('history')}
+          >
+            📜 历史
+          </button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px 16px' }}>
+
+          {leftTab === 'library' && (
+            <LibraryPanel
+              selectedCaseId={selectedCaseId}
+              onSelectCase={handleLibraryCaseSelect}
+              onSolveCase={handleSolveLibraryCase}
+              busy={isSolving}
+            />
+          )}
+
+          {leftTab === 'custom' && (
+            <>
           <div className="section">
             <div className="section-title">方程类型</div>
             <div className="pde-type-selector">
@@ -581,6 +747,27 @@ function App() {
                     onChange={(e) => setLogInterval(Math.max(1, Math.min(500, parseInt(e.target.value) || 20)))}
                   />
                 </div>
+                <div style={{ marginTop: 10, borderTop: '1px solid var(--border-color)', paddingTop: 10 }}>
+                  <div className="checkbox-row">
+                    <label className="check-label">
+                      <input type="checkbox" checked={runFdmOnSolve} onChange={(e) => setRunFdmOnSolve(e.target.checked)} />
+                      <span style={{ color: '#5eead4' }}>📊 求解后运行FDM并对比</span>
+                    </label>
+                  </div>
+                  <div className="checkbox-row">
+                    <label className="check-label">
+                      <input type="checkbox" checked={runHpOnSolve} onChange={(e) => setRunHpOnSolve(e.target.checked)} />
+                      <span style={{ color: '#c4b5fd' }}>🔍 先运行超参搜索再训练</span>
+                    </label>
+                  </div>
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <HyperOptPanel
+                    defaultPdeType={selectedType}
+                    disabled={isSolving}
+                    onApplyBest={applyHyperOptBest}
+                  />
+                </div>
               </div>
             )}
           </div>
@@ -640,22 +827,90 @@ function App() {
               <LossChart history={trainingHistory} />
             </div>
           )}
+          </>
+          )}
 
-          <HistoryPanel
-            records={history}
-            selectedId={selectedRecordId}
-            onSelect={handleSelectRecord}
-            onDelete={handleDeleteRecord}
-            onRefresh={loadHistory}
-          />
+          {leftTab === 'history' && (
+            <>
+              {trainingHistory.length > 0 && (
+                <div className="training-progress" style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>最近训练损失曲线</div>
+                  <LossChart history={trainingHistory} />
+                </div>
+              )}
+              <HistoryPanel
+                records={history}
+                selectedId={selectedRecordId}
+                onSelect={handleSelectRecord}
+                onDelete={handleDeleteRecord}
+                onRefresh={loadHistory}
+              />
+            </>
+          )}
 
-          <ExportPanel recordId={currentRecordId} disabled={isSolving} />
+          {leftTab !== 'history' && (
+            <>
+              {trainingHistory.length > 0 && leftTab === 'library' && (
+                <div className="training-progress" style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>训练损失曲线</div>
+                  <LossChart history={trainingHistory} />
+                </div>
+              )}
+              {solveStatus && leftTab === 'library' && (
+                <div style={{ marginTop: 8 }}>
+                  <span className={`status-badge ${solveStatus}`}>
+                    {solveStatus === 'solving' && progressEta && `求解中 · epoch ${progressEta.epoch}/${epochs} (${progressEta.progressPct.toFixed(1)}%)`}
+                    {solveStatus === 'solving' && !progressEta && '求解中 (初始化中...)'}
+                    {solveStatus === 'completed' && '已完成'}
+                    {solveStatus === 'error' && '出错'}
+                  </span>
+                  {solveErrorMsg && (
+                    <div style={{ color: '#ff6b6b', fontSize: 12, marginTop: 6, lineHeight: 1.5, wordBreak: 'break-word' }}>
+                      {solveErrorMsg}
+                    </div>
+                  )}
+                </div>
+              )}
+              <ExportPanel recordId={currentRecordId} disabled={isSolving} />
+            </>
+          )}
         </div>
       </div>
 
       <div className="main-content">
         <div className="top-bar">
-          <span className="top-bar-title">数值解可视化</span>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: 2, background: 'var(--bg-tertiary)', borderRadius: 6, padding: 3 }}>
+              <button
+                onClick={() => setMainBottomTab('viz')}
+                className={`main-tab ${mainBottomTab === 'viz' ? 'active' : ''}`}
+              >
+                📈 可视化
+              </button>
+              <button
+                onClick={() => setMainBottomTab('compare')}
+                disabled={!comparison}
+                className={`main-tab ${mainBottomTab === 'compare' ? 'active' : ''} ${!comparison ? 'disabled' : ''}`}
+              >
+                {comparison ? '📊 方法对比' : '📊 对比 (无数据)'}
+              </button>
+            </div>
+            {selectedCaseDetail && (
+              <span style={{
+                fontSize: 11,
+                padding: '3px 10px',
+                borderRadius: 12,
+                background: 'rgba(59, 130, 246, 0.15)',
+                border: '1px solid rgba(59, 130, 246, 0.3)',
+                color: '#93c5fd',
+              }}>
+                📚 {selectedCaseDetail.name}
+              </span>
+            )}
+          </div>
+          <span className="top-bar-title" style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)' }}>
+            数值解
+          </span>
           <div className="toolbar">
             {hasUncertainty && (
               <>
@@ -735,6 +990,8 @@ function App() {
         </div>
 
         <div className="content-area">
+          {mainBottomTab === 'viz' && (
+            <>
           <Visualization3D
             gridData={gridData}
             isAnimating={isAnimating}
@@ -788,6 +1045,35 @@ function App() {
                 </div>
               )}
             </>
+          )}
+            </>
+          )}
+
+          {mainBottomTab === 'compare' && (
+            <div style={{ padding: 20, overflowY: 'auto' }}>
+              {comparison ? (
+                <ComparisonPanel
+                  result={comparison}
+                  caseName={selectedCaseDetail?.name}
+                />
+              ) : (
+                <div style={{
+                  height: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexDirection: 'column',
+                  gap: 12,
+                  color: 'var(--text-secondary)',
+                }}>
+                  <div style={{ fontSize: 48 }}>📊</div>
+                  <div style={{ fontSize: 16 }}>暂无对比数据</div>
+                  <div style={{ fontSize: 12, textAlign: 'center', maxWidth: 400 }}>
+                    请在左侧高级选项中勾选"📊 求解后运行FDM并对比"，或从方程库选择支持FDM对比的案例（标有"FDM对比"标签），运行求解后即可显示PINN与传统方法的误差、速度对比。
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>

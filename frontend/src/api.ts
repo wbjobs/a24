@@ -191,3 +191,156 @@ export function createSSEConnection(handler: SSEHandler): EventSource {
 }
 
 export default api
+
+// ---------- 方程库 ----------
+
+export interface LibraryCase {
+  id: string
+  name: string
+  pde_type: string
+  n_dims: number
+  category: string
+  difficulty: string | number
+  description: string
+  equation_latex: string
+  default_epochs: number
+  default_layers: number[]
+  has_fdm_reference: boolean
+}
+
+export interface LibraryCaseDetail extends LibraryCase {
+  params: Record<string, number>
+  domain: Record<string, [number, number]>
+  ic_expression: string
+  ic_dt_expression?: string
+  bc_left_expression: string
+  bc_right_expression: string
+  analytical_solution?: string
+  difficulty: string
+}
+
+export interface LibraryIndexResponse {
+  total: number
+  filtered: number
+  categories: string[]
+  pde_types: string[]
+  cases: LibraryCase[]
+}
+
+export const fetchLibraryIndex = (params?: { category?: string; difficulty?: string; pde_type?: string }) =>
+  api.get<LibraryIndexResponse>('/library', { params })
+
+export const fetchLibraryCase = (caseId: string) =>
+  api.get<LibraryCaseDetail>(`/library/${caseId}`)
+
+export interface LibrarySolveRequest {
+  epochs?: number
+  layers?: number[]
+  use_fourier?: boolean
+  use_adaptive_activation?: boolean
+  use_hard_constraint?: boolean
+  use_mc_dropout?: boolean
+  fourier_bands?: number[]
+  fourier_freqs?: number
+  dropout_rate?: number
+  mc_samples?: number
+  log_interval?: number
+  n_collocation?: number
+  learning_rate?: number
+  run_fdm_compare?: boolean
+  run_hyperopt?: boolean
+  hp_n_trials?: number
+  hp_quick_epochs?: number
+  name?: string
+}
+
+export interface ComparisonResult {
+  l2_error: number
+  linf_error: number
+  relative_error: number
+  pinn_time_sec: number
+  fdm_time_sec: number
+  speedup_ratio: number
+  fdm_method: string
+  fdm_info?: {
+    method: string
+    nx: number
+    nt: number
+    elapsed_sec: number
+  }
+  per_time_step_errors?: Record<string, number>
+}
+
+export interface LibrarySolveCompleteResponse extends SolveCompleteResponse {
+  case_id: string
+  training_time_sec: number
+  comparison?: ComparisonResult
+}
+
+export const solveLibraryCase = (caseId: string, data: LibrarySolveRequest) =>
+  api.post<SolveStartResponse>(`/library/${caseId}/solve`, data)
+
+// ---------- 超参数搜索 ----------
+
+export interface HyperOptStartRequest {
+  pde_type: string
+  n_dims?: number
+  domain?: Record<string, [number, number]>
+  t_domain?: [number, number]
+  params?: Record<string, number>
+  ic_expression?: string
+  bc_left_expression?: string
+  bc_right_expression?: string
+  n_trials?: number
+  quick_epochs?: number
+}
+
+export interface HyperOptStatusResponse {
+  running: boolean
+  progress_count: number
+  progress: { trial: number; best_loss: number; best_params: Record<string, any>; time: number }[]
+  result?: {
+    best_loss: number
+    best_params: Record<string, any>
+    all_trials: any[]
+  }
+  error?: string
+}
+
+export const startHyperOpt = (data: HyperOptStartRequest) =>
+  api.post<{ status: string; n_trials: number; pde_type: string }>('/hyperopt/start', data)
+
+export const getHyperOptStatus = () =>
+  api.get<HyperOptStatusResponse>('/hyperopt/status')
+
+// ---------- FDM 求解器 ----------
+
+export interface FDMSolveRequest {
+  pde_type: string
+  ic?: string
+  ic_dt?: string
+  bc_left?: string
+  bc_right?: string
+  params?: Record<string, number>
+  domain?: Record<string, [number, number]>
+  nx?: number
+  nt?: number
+}
+
+export const solveFDM = (data: FDMSolveRequest) =>
+  api.post<any>('/fdm/solve', data)
+
+// ---------- 系统能力 ----------
+
+export interface SystemCapabilities {
+  horovod_available: boolean
+  optuna_available: boolean
+  fdm_available: boolean
+  library_available: boolean
+  nd_solver_available: boolean
+  library_cases: number
+  supported_pde_types: string[]
+}
+
+export const fetchSystemCapabilities = () =>
+  api.get<SystemCapabilities>('/system/capabilities')

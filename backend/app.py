@@ -477,5 +477,18 @@ def export_result(record_id, format):
         return jsonify({'error': f'Unsupported format: {format}'}), 400
 
 
+# ---------- 加载高级功能路由 ----------
+try:
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from advanced_routes import register_advanced_routes
+    register_advanced_routes(app)
+    print('[App] 高级功能路由已加载：方程库 / 超参搜索 / FDM对比 / 分布式训练')
+except Exception as e:
+    import traceback
+    print(f'[App WARNING] 高级功能路由加载失败: {e}')
+    traceback.print_exc()
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
